@@ -1,0 +1,29 @@
+# Build artifacts
+bin/
+*.o
+*.d
+*.a
+
+# Debug symbols (macOS)
+*.dSYM/
+
+# Core dumps
+core
+core.*
+vgcore.*
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.cache/
+compile_commands.json
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Logs (e.g. local test runs)
+*.log
