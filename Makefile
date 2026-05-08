@@ -1,10 +1,11 @@
 CC      = gcc
-CFLAGS  = -Wall -Wextra -O2 -g -MMD -MP -pthread -Icommon -Iserver
-LDFLAGS = -pthread -lm
+CFLAGS  = -Wall -Wextra -O2 -g -MMD -MP -pthread -Icommon -Iserver -Iclient
+LDFLAGS = -pthread -lm -lncurses
 
-COMMON_OBJ = common/protocol.o common/log.o
-SERVER_OBJ = server/server_main.o server/drone_table.o server/mission.o $(COMMON_OBJ)
-CLIENT_OBJ = client/drone_main.o $(COMMON_OBJ)
+COMMON_OBJ = common/protocol.o common/log.o common/event_bus.o
+SERVER_OBJ = server/server_main.o server/drone_table.o server/mission.o \
+             server/ui.o $(COMMON_OBJ)
+CLIENT_OBJ = client/drone_main.o client/drone_ui.o $(COMMON_OBJ)
 
 ALL_OBJ = $(SERVER_OBJ) $(CLIENT_OBJ)
 DEPS    = $(ALL_OBJ:.o=.d)

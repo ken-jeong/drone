@@ -6,6 +6,7 @@
 #include <signal.h>
 #include <errno.h>
 #include <math.h>
+#include <sys/time.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
@@ -13,8 +14,10 @@
 #include "config.h"
 #include "protocol.h"
 #include "log.h"
+#include "event_bus.h"
 #include "drone_table.h"
 #include "mission.h"
+#include "ui.h"
 
 typedef struct {
     int             listen_fd;
@@ -26,11 +29,22 @@ typedef struct {
     drone_table_t  *table;
 } worker_arg_t;
 
-static volatile int g_shutdown = 0;
+static volatile int              g_shutdown = 0;
+static volatile mission_phase_t  g_phase    = MISSION_INIT;
 
-static void on_sigint(int sig) { (void)sig; g_shutdown = 1; }
+static void on_sigint(int sig) {
+    (void)sig;
+    g_shutdown = 1;
+    ui_request_quit();
+}
 
-/* ---------- 워커 쓰레드: 한 드론 클라이언트의 수신 루프 ---------- */
+static long now_ms(void) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (long)tv.tv_sec * 1000L + (long)tv.tv_usec / 1000L;
+}
+
+/* ---------- 워커 쓰레드 ---------- */
 
 static void *worker_thread(void *arg) {
     worker_arg_t *w = (worker_arg_t *)arg;
@@ -42,10 +56,9 @@ static void *worker_thread(void *arg) {
     uint8_t  buf[MAX_PAYLOAD];
     uint16_t len;
 
-    /* 1) HELLO 수신 */
     int r = recv_msg(sock, &type, buf, sizeof(buf), &len);
     if (r != 0 || type != MSG_HELLO || len != 4) {
-        log_msg("[server] bad HELLO from sock=%d", sock);
+        log_event(EV_WARN, "[server] bad HELLO from sock=%d", sock);
         close(sock);
         return NULL;
     }
@@ -53,21 +66,20 @@ static void *worker_thread(void *arg) {
 
     int idx = table_add(table, my_id, sock);
     if (idx < 0) {
-        log_msg("[server] table full, rejecting drone %d", my_id);
+        log_event(EV_WARN, "[server] table full, rejecting drone %d", my_id);
         close(sock);
         return NULL;
     }
 
-    /* 2) HELLO_ACK 송신 */
     pack_int32(buf, 0, my_id);
     table_send_to(table, my_id, MSG_HELLO_ACK, buf, 4);
-    log_msg("[server] drone %d connected (slot=%d)", my_id, idx);
+    log_event(EV_TX, "[server] TX HELLO_ACK drone=%d", my_id);
+    log_event(EV_INFO, "[server] drone %d connected (slot=%d)", my_id, idx);
 
-    /* 3) 메시지 수신 루프 */
     for (;;) {
         r = recv_msg(sock, &type, buf, sizeof(buf), &len);
         if (r != 0) {
-            log_msg("[server] drone %d disconnected", my_id);
+            log_event(EV_INFO, "[server] drone %d disconnected", my_id);
             break;
         }
 
@@ -75,17 +87,19 @@ static void *worker_thread(void *arg) {
             double x = coord_from_wire(unpack_int32(buf, 4));
             double y = coord_from_wire(unpack_int32(buf, 8));
             table_update_pos(table, my_id, x, y);
-            log_msg("[server] RX POS_REPORT drone=%d (%.2f, %.2f)",
-                    my_id, x, y);
+            log_event(EV_RX, "POS_REPORT drone=%d (%.2f, %.2f)",
+                      my_id, x, y);
         } else if (type == MSG_ARRIVED && len == 12) {
             double x = coord_from_wire(unpack_int32(buf, 4));
             double y = coord_from_wire(unpack_int32(buf, 8));
             table_update_pos(table, my_id, x, y);
-            log_msg("[server] RX ARRIVED   drone=%d (%.2f, %.2f)",
-                    my_id, x, y);
+            table_set_arrived(table, my_id);
+            log_event(EV_RX, "ARRIVED    drone=%d (%.2f, %.2f)",
+                      my_id, x, y);
         } else {
-            log_msg("[server] RX unknown type=0x%02x len=%u from drone=%d",
-                    type, len, my_id);
+            log_event(EV_WARN,
+                      "[server] RX unknown type=0x%02x len=%u from drone=%d",
+                      type, len, my_id);
         }
     }
 
@@ -121,7 +135,7 @@ static void *accept_thread(void *arg) {
     return NULL;
 }
 
-/* ---------- 미션 컨트롤러 헬퍼 ---------- */
+/* ---------- 미션 헬퍼 ---------- */
 
 static int collect_active_ids(drone_table_t *t, int *ids, int max) {
     drone_entry_t snap[MAX_DRONES];
@@ -163,39 +177,73 @@ static void send_move_cmd(drone_table_t *t, int id, double tx, double ty) {
     pack_int32(buf, 0, coord_to_wire(tx));
     pack_int32(buf, 4, coord_to_wire(ty));
     table_send_to(t, id, MSG_MOVE_CMD, buf, 8);
-    log_msg("[server] TX MOVE_CMD  drone=%d -> (%.2f, %.2f)", id, tx, ty);
+    table_set_goto(t, id, tx, ty);
+    log_event(EV_TX, "MOVE_CMD   drone=%d -> (%.2f, %.2f)", id, tx, ty);
 }
 
 static void send_phase_ack(drone_table_t *t, int id, int phase) {
     uint8_t buf[4];
     pack_int32(buf, 0, phase);
     table_send_to(t, id, MSG_PHASE_ACK, buf, 4);
+    log_event(EV_TX, "PHASE_ACK  drone=%d phase=%d", id, phase);
 }
 
 static void send_terminate(drone_table_t *t, int id) {
     table_send_to(t, id, MSG_TERMINATE, NULL, 0);
-    log_msg("[server] TX TERMINATE drone=%d", id);
+    table_set_terminated(t, id);
+    log_event(EV_TX, "TERMINATE  drone=%d", id);
 }
 
 static void wait_for_arrival(drone_table_t *t,
                              const int *ids, int n,
                              const double *tx, const double *ty) {
-    while (!all_arrived(t, ids, n, tx, ty)) {
+    while (!g_shutdown && !ui_should_quit() &&
+           !all_arrived(t, ids, n, tx, ty)) {
         usleep(MISSION_POLL_MS * 1000);
     }
 }
 
+static void set_phase(mission_phase_t p) {
+    g_phase = p;
+    log_event(EV_PHASE, "*** %s ***", phase_name(p));
+}
+
 /* ---------- main ---------- */
+
+static void usage(const char *p) {
+    fprintf(stderr,
+            "usage: %s [port] [expected_drones] [--no-tui]\n"
+            "  default: port=%d expected=%d\n",
+            p, DEFAULT_PORT, DEFAULT_EXPECTED_DRONES);
+}
 
 int main(int argc, char **argv) {
     int port     = DEFAULT_PORT;
     int expected = DEFAULT_EXPECTED_DRONES;
-    if (argc >= 2) port     = atoi(argv[1]);
-    if (argc >= 3) expected = atoi(argv[2]);
+    int use_tui  = 1;
+
+    int positional = 0;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--no-tui") == 0) {
+            use_tui = 0;
+        } else if (strcmp(argv[i], "-h") == 0 ||
+                   strcmp(argv[i], "--help") == 0) {
+            usage(argv[0]);
+            return 0;
+        } else if (positional == 0) {
+            port = atoi(argv[i]); positional++;
+        } else if (positional == 1) {
+            expected = atoi(argv[i]); positional++;
+        } else {
+            usage(argv[0]);
+            return 1;
+        }
+    }
     if (expected < 3) expected = 3;
     if (expected > MAX_DRONES) expected = MAX_DRONES;
 
     log_init();
+    event_bus_init(200);
     signal(SIGPIPE, SIG_IGN);
     signal(SIGINT, on_sigint);
 
@@ -215,8 +263,8 @@ int main(int argc, char **argv) {
     }
     if (listen(lfd, 16) < 0) { perror("listen"); return 1; }
 
-    log_msg("[server] listening on port %d, expecting %d drones",
-            port, expected);
+    log_event(EV_INFO, "[server] listening on port %d, expecting %d drones",
+              port, expected);
 
     drone_table_t table;
     table_init(&table);
@@ -225,64 +273,105 @@ int main(int argc, char **argv) {
     pthread_t atid;
     pthread_create(&atid, NULL, accept_thread, &aarg);
 
+    /* TUI 시작 */
+    pthread_t ui_tid = 0;
+    int ui_running = 0;
+    ui_ctx_t uctx = { &table, &g_phase, now_ms(), expected };
+
+    if (use_tui) {
+        if (ui_init() == 0) {
+            log_set_quiet(1);
+            if (pthread_create(&ui_tid, NULL, ui_thread, &uctx) == 0) {
+                ui_running = 1;
+            } else {
+                ui_shutdown();
+                log_set_quiet(0);
+            }
+        } else {
+            fprintf(stderr,
+                    "ui_init failed, falling back to stdout mode\n");
+        }
+    }
+
     /* ===== 미션 시퀀스 ===== */
 
-    log_msg("[mission] %s — waiting for %d drones",
-            phase_name(MISSION_INIT), expected);
+    set_phase(MISSION_INIT);
+    log_event(EV_INFO, "[mission] %s — waiting for %d drones",
+              phase_name(MISSION_INIT), expected);
     table_wait_count(&table, expected);
-    log_msg("[mission] all %d drones connected", expected);
+    log_event(EV_INFO, "[mission] all %d drones connected", expected);
 
     int ids[MAX_DRONES];
     int n = collect_active_ids(&table, ids, MAX_DRONES);
 
-    /* ----- 1차 이동 ----- */
+    /* 1차 이동 */
     double tx1[MAX_DRONES], ty1[MAX_DRONES];
     compute_phase1_targets(n, tx1, ty1);
 
-    log_msg("[mission] %s — dispatching phase 1 targets",
-            phase_name(MISSION_PHASE1_GO));
+    set_phase(MISSION_PHASE1_GO);
+    log_event(EV_INFO, "[mission] dispatching phase 1 targets");
     for (int i = 0; i < n; i++) {
         send_move_cmd(&table, ids[i], tx1[i], ty1[i]);
     }
 
     wait_for_arrival(&table, ids, n, tx1, ty1);
 
-    if (!phase1_global_ok(&table)) {
-        log_msg("[mission] WARNING: phase1 global check (radius/gap) failed");
-    } else {
-        log_msg("[mission] phase1 global check OK (radius<=30m, gap>=10m)");
-    }
-    log_msg("[mission] %s", phase_name(MISSION_PHASE1_OK));
-    for (int i = 0; i < n; i++) send_phase_ack(&table, ids[i], 1);
-
-    /* ----- 2차 이동: 좌측 50m ----- */
-    double tx2[MAX_DRONES], ty2[MAX_DRONES];
-    for (int i = 0; i < n; i++) {
-        tx2[i] = tx1[i] - PHASE2_LEFT_SHIFT;
-        ty2[i] = ty1[i];
+    if (!g_shutdown && !ui_should_quit()) {
+        if (!phase1_global_ok(&table)) {
+            log_event(EV_WARN,
+                      "[mission] phase1 global check (radius/gap) FAILED");
+        } else {
+            log_event(EV_INFO,
+                      "[mission] phase1 global check OK (r<=30m, gap>=10m)");
+        }
+        set_phase(MISSION_PHASE1_OK);
+        for (int i = 0; i < n; i++) send_phase_ack(&table, ids[i], 1);
     }
 
-    log_msg("[mission] %s — dispatching phase 2 targets",
-            phase_name(MISSION_PHASE2_GO));
-    for (int i = 0; i < n; i++) {
-        send_move_cmd(&table, ids[i], tx2[i], ty2[i]);
+    /* 2차 이동 */
+    if (!g_shutdown && !ui_should_quit()) {
+        double tx2[MAX_DRONES], ty2[MAX_DRONES];
+        for (int i = 0; i < n; i++) {
+            tx2[i] = tx1[i] - PHASE2_LEFT_SHIFT;
+            ty2[i] = ty1[i];
+        }
+
+        set_phase(MISSION_PHASE2_GO);
+        log_event(EV_INFO, "[mission] dispatching phase 2 targets");
+        for (int i = 0; i < n; i++) {
+            send_move_cmd(&table, ids[i], tx2[i], ty2[i]);
+        }
+
+        wait_for_arrival(&table, ids, n, tx2, ty2);
+
+        if (!g_shutdown && !ui_should_quit()) {
+            set_phase(MISSION_PHASE2_OK);
+            for (int i = 0; i < n; i++) send_phase_ack(&table, ids[i], 2);
+        }
     }
 
-    wait_for_arrival(&table, ids, n, tx2, ty2);
-    log_msg("[mission] %s", phase_name(MISSION_PHASE2_OK));
-    for (int i = 0; i < n; i++) send_phase_ack(&table, ids[i], 2);
-
-    /* ----- 종료 ----- */
+    /* 종료 */
     for (int i = 0; i < n; i++) send_terminate(&table, ids[i]);
-    log_msg("[mission] %s", phase_name(MISSION_DONE));
+    set_phase(MISSION_DONE);
 
-    sleep(1);
+    /* 사용자가 결과 화면을 볼 시간 */
+    if (ui_running) {
+        for (int i = 0; i < 30 && !ui_should_quit(); i++) {
+            usleep(100 * 1000);
+        }
+        ui_request_quit();
+        pthread_join(ui_tid, NULL);
+        ui_shutdown();
+        log_set_quiet(0);
+    } else {
+        sleep(1);
+    }
+
     g_shutdown = 1;
     shutdown(lfd, SHUT_RDWR);
     close(lfd);
-
-    /* 워커들이 정리될 시간 부여 후 종료 */
     sleep(1);
     table_destroy(&table);
+    event_bus_destroy();
     return 0;
 }

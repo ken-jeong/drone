@@ -3,6 +3,13 @@
 
 #include <string.h>
 #include <unistd.h>
+#include <sys/time.h>
+
+static long now_ms(void) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (long)tv.tv_sec * 1000L + (long)tv.tv_usec / 1000L;
+}
 
 void table_init(drone_table_t *t) {
     memset(t, 0, sizeof(*t));
@@ -28,16 +35,17 @@ int table_add(drone_table_t *t, int id, int sock) {
     for (int i = 0; i < MAX_DRONES; i++) {
         if (!t->drones[i].active) {
             drone_entry_t *e = &t->drones[i];
-            e->id          = id;
-            e->active      = 1;
-            e->socket_fd   = sock;
-            e->x           = 0.0;
-            e->y           = 0.0;
-            e->mode        = DRONE_RANDOM;
-            e->target_x    = 0.0;
-            e->target_y    = 0.0;
-            e->phase1_done = 0;
-            e->phase2_done = 0;
+            e->id           = id;
+            e->active       = 1;
+            e->socket_fd    = sock;
+            e->x            = 0.0;
+            e->y            = 0.0;
+            e->mode         = DRONE_RANDOM;
+            e->target_x     = 0.0;
+            e->target_y     = 0.0;
+            e->last_seen_ms = now_ms();
+            e->phase1_done  = 0;
+            e->phase2_done  = 0;
             t->count++;
             idx = i;
             break;
@@ -54,6 +62,45 @@ void table_update_pos(drone_table_t *t, int id, double x, double y) {
         if (t->drones[i].active && t->drones[i].id == id) {
             t->drones[i].x = x;
             t->drones[i].y = y;
+            t->drones[i].last_seen_ms = now_ms();
+            break;
+        }
+    }
+    pthread_cond_broadcast(&t->state_changed);
+    pthread_mutex_unlock(&t->table_lock);
+}
+
+void table_set_goto(drone_table_t *t, int id, double tx, double ty) {
+    pthread_mutex_lock(&t->table_lock);
+    for (int i = 0; i < MAX_DRONES; i++) {
+        if (t->drones[i].active && t->drones[i].id == id) {
+            t->drones[i].target_x = tx;
+            t->drones[i].target_y = ty;
+            t->drones[i].mode     = DRONE_GOTO;
+            break;
+        }
+    }
+    pthread_cond_broadcast(&t->state_changed);
+    pthread_mutex_unlock(&t->table_lock);
+}
+
+void table_set_arrived(drone_table_t *t, int id) {
+    pthread_mutex_lock(&t->table_lock);
+    for (int i = 0; i < MAX_DRONES; i++) {
+        if (t->drones[i].active && t->drones[i].id == id) {
+            t->drones[i].mode = DRONE_HOLD;
+            break;
+        }
+    }
+    pthread_cond_broadcast(&t->state_changed);
+    pthread_mutex_unlock(&t->table_lock);
+}
+
+void table_set_terminated(drone_table_t *t, int id) {
+    pthread_mutex_lock(&t->table_lock);
+    for (int i = 0; i < MAX_DRONES; i++) {
+        if (t->drones[i].active && t->drones[i].id == id) {
+            t->drones[i].mode = DRONE_TERMINATED;
             break;
         }
     }
